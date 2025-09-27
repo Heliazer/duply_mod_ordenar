@@ -1,0 +1,27 @@
+{
+  "scan_id": "35bf85cb-f294-4ce3-926a-bf5aa596b2ee",
+  "timestamp": "20250927T012548Z",
+  "scan_path": "C:\\Users\\FedericoAGC\\Documents\\MEGA\\Duply\\preubas",
+  "method": "hybrid",
+  "recursive": true,
+  "extensions": [],
+  "duplicates": {
+    "452edef1edf6f35b22a6be51a4e096a6": [
+      "C:\\Users\\FedericoAGC\\Documents\\MEGA\\Duply\\preubas\\Criptografía_Conceptos_Claves - copia.pdf",
+      "C:\\Users\\FedericoAGC\\Documents\\MEGA\\Duply\\preubas\\Criptografía_Conceptos_Claves.pdf"
+    ],
+    "bbc5ae925e67fd6f797fa187351d3df2": [
+      "C:\\Users\\FedericoAGC\\Documents\\MEGA\\Duply\\preubas\\Álgebra Lineal (MathRocks) - Hoffman - copia.pdf",
+      "C:\\Users\\FedericoAGC\\Documents\\MEGA\\Duply\\preubas\\Álgebra Lineal (MathRocks) - Hoffman.pdf"
+    ]
+  },
+  "stats": {
+    "total_duplicate_groups": 2,
+    "total_duplicate_files": 4,
+    "wasted_files": 2,
+    "total_size_bytes": 18637384,
+    "wasted_size_bytes": 9318692,
+    "wasted_size_mb": 8.89,
+    "wasted_size_gb": 0.01
+  }
+}

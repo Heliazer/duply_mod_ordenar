@@ -1,0 +1,2 @@
+2025-09-27T01:25:47Z [INFO] api_request: Scan request received | client_ip=127.0.0.1 component=api env=dev method=POST params_hash=b95e518694b7 request_id=928ffea0-3977-42b8-9fe8-be71d5ebeb60 route=/scan version=1.0.0
+2025-09-27T01:25:48Z [INFO] api_response: Scan request completed | component=api duplicate_groups=2 duration_ms=69 env=dev method=POST request_id=928ffea0-3977-42b8-9fe8-be71d5ebeb60 route=/scan scan_id=35bf85cb-f294-4ce3-926a-bf5aa596b2ee status_code=200 version=1.0.0
