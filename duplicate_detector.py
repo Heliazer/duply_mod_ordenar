@@ -8,6 +8,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 from logging.handlers import RotatingFileHandler
 import sys
 import time
@@ -15,7 +17,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 MODULE_VERSION = "1.0.0"
 DEFAULT_ENV = "dev"
@@ -29,6 +31,11 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 GENERAL_TEXT_LOG_FILENAME = "duplicate-detector.txt"
 API_TEXT_LOG_FILENAME = "duplicate-detector.api.txt"
 LOG_BACKUP_COUNT = 5
+DEFAULT_QUARANTINE_DIRNAME = ".quarantine"
+PLAN_SURVIVOR_POLICIES = {"keep_first", "keep_oldest", "keep_newest"}
+PLAN_ACTIONS = {"move_to_quarantine", "delete"}
+PLAN_COLLISION_STRATEGIES = {"rename", "skip", "overwrite"}
+
 API_LOG_BACKUP_COUNT = 3
 
 def _iso_utc(timestamp: float) -> str:
@@ -171,6 +178,175 @@ class DuplicateDetector:
             logger.addHandler(api_text_handler)
 
         return logger
+
+    @staticmethod
+    def _collect_file_info(path_str: Union[str, Path], order: int) -> Dict[str, Any]:
+        path = Path(path_str)
+        exists = path.exists()
+        error: Optional[str] = None
+        size: Optional[int] = None
+        modified: Optional[float] = None
+        if exists:
+            try:
+                stat = path.stat()
+                size = stat.st_size
+                modified = stat.st_mtime
+            except OSError as exc:
+                exists = False
+                error = str(exc)
+        return {
+            "order": order,
+            "path": path,
+            "path_str": str(path),
+            "exists": exists,
+            "size": size,
+            "modified": modified,
+            "error": error,
+        }
+
+    @staticmethod
+    def _select_survivor_info(file_infos: List[Dict[str, Any]], policy: str) -> Dict[str, Any]:
+        if not file_infos:
+            raise ValueError("file_infos cannot be empty for survivor selection")
+
+        existing = [info for info in file_infos if info["exists"]]
+        if not existing:
+            return file_infos[0]
+
+        if policy == "keep_first":
+            for info in file_infos:
+                if info["exists"]:
+                    return info
+            return existing[0]
+
+        if policy == "keep_oldest":
+            return min(
+                existing,
+                key=lambda info: (
+                    info["modified"] if info["modified"] is not None else float("inf"),
+                    info["order"],
+                ),
+            )
+
+        if policy == "keep_newest":
+            return max(
+                existing,
+                key=lambda info: (
+                    info["modified"] if info["modified"] is not None else float("-inf"),
+                    -info["order"],
+                ),
+            )
+
+        return existing[0]
+
+    @staticmethod
+    def _build_quarantine_destination(base_dir: Path, source_path: Path) -> Path:
+        try:
+            resolved = source_path.resolve()
+        except Exception:
+            resolved = source_path
+
+        parts: List[str] = []
+
+        if resolved.drive:
+            drive_clean = re.sub(r"[^A-Za-z0-9._-]+", "_", resolved.drive.replace(":", "_"))
+            if drive_clean:
+                parts.append(drive_clean)
+            remaining = list(resolved.parts)[1:]
+        elif resolved.is_absolute():
+            remaining = list(resolved.parts)[1:]
+        else:
+            remaining = list(resolved.parts)
+
+        for part in remaining:
+            if part in {"", ".", ".."}:
+                cleaned = part.replace(".", "_")
+            else:
+                cleaned = part
+            cleaned = re.sub(r"[\\/]+", "_", cleaned)
+            cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", cleaned)
+            if not cleaned:
+                cleaned = "_"
+            parts.append(cleaned)
+
+        if not parts:
+            fallback = source_path.name or "file"
+            parts.append(re.sub(r"[^A-Za-z0-9._-]+", "_", fallback))
+
+        return base_dir.joinpath(*parts)
+
+    @staticmethod
+    def _resolve_destination_collision(
+        destination: Path,
+        strategy: str,
+        reserved: Set[Path],
+    ) -> Tuple[Optional[Path], Optional[str]]:
+        try:
+            normalized = destination.expanduser().resolve(strict=False)
+        except Exception:
+            normalized = destination.expanduser()
+
+        already_reserved = normalized in reserved
+        try:
+            exists = normalized.exists()
+        except OSError:
+            exists = False
+
+        if not already_reserved and not exists:
+            return normalized, None
+
+        if strategy == "overwrite":
+            return normalized, None
+
+        if strategy == "skip":
+            return None, "destination_exists"
+
+        if strategy == "rename":
+            counter = 1
+            candidate = normalized
+            stem = normalized.stem
+            suffix = normalized.suffix
+            while candidate in reserved or candidate.exists():
+                candidate = normalized.with_name(f"{stem}__dup{counter}{suffix}")
+                counter += 1
+            return candidate, None
+
+        return None, "invalid_strategy"
+
+    @staticmethod
+    def _ensure_json_serializable(plan: Dict[str, Any]) -> Dict[str, Any]:
+        def _coerce(value: Any) -> Any:
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, list):
+                return [_coerce(item) for item in value]
+            if isinstance(value, dict):
+                return {key: _coerce(val) for key, val in value.items()}
+            return value
+
+        return _coerce(plan)
+
+    @staticmethod
+    def _load_plan_source(
+        plan: Union[Dict[str, Any], str, Path],
+    ) -> Tuple[Dict[str, Any], Optional[Path]]:
+        if isinstance(plan, dict):
+            return dict(plan), None
+        if isinstance(plan, (str, Path)):
+            plan_path = Path(plan)
+            data = json.loads(plan_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("plan JSON must decode to a dictionary")
+            return data, plan_path
+        raise TypeError("plan must be a dict or a filesystem path")
+
+    @staticmethod
+    def _write_json_file(path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def _ensure_extensions(self, extensions: Optional[List[str]]) -> Optional[List[str]]:
         if not extensions:
@@ -821,6 +997,496 @@ class DuplicateDetector:
             size_map[file_size].append(str(file_path))
         return dict(size_map)
 
+
+    def generate_action_plan(
+        self,
+        duplicates: Dict[str, List[str]],
+        *,
+        policy: str = "keep_newest",
+        action: str = "move_to_quarantine",
+        collision_strategy: str = "rename",
+        quarantine_dir: Optional[Union[str, Path]] = None,
+        output_file: Optional[Union[str, Path]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create a plan describing how to handle duplicate files."""
+        if policy not in PLAN_SURVIVOR_POLICIES:
+            raise ValueError(f"policy must be one of {sorted(PLAN_SURVIVOR_POLICIES)}")
+        if action not in PLAN_ACTIONS:
+            raise ValueError(f"action must be one of {sorted(PLAN_ACTIONS)}")
+        if collision_strategy not in PLAN_COLLISION_STRATEGIES:
+            raise ValueError(
+                f"collision_strategy must be one of {sorted(PLAN_COLLISION_STRATEGIES)}"
+            )
+
+        plan_id = str(uuid.uuid4())
+        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        context = self._resolve_context(self._last_scan_context)
+
+        if quarantine_dir is not None:
+            base_quarantine = Path(quarantine_dir)
+        else:
+            root_dir = context.get("root_dir") or ""
+            if root_dir:
+                base_quarantine = Path(root_dir) / DEFAULT_QUARANTINE_DIRNAME
+            else:
+                base_quarantine = Path.cwd() / DEFAULT_QUARANTINE_DIRNAME
+
+        try:
+            base_quarantine = base_quarantine.expanduser().resolve(strict=False)
+        except Exception:
+            base_quarantine = base_quarantine.expanduser()
+
+        plan_groups: List[Dict[str, Any]] = []
+        reserved_targets: Set[Path] = set()
+        files_to_act = 0
+        files_skipped = 0
+        files_missing = 0
+        wasted_size_bytes = 0
+
+        for idx, (group_key, files) in enumerate(duplicates.items(), start=1):
+            if not files:
+                continue
+
+            file_infos = [
+                self._collect_file_info(path_str, order)
+                for order, path_str in enumerate(files)
+            ]
+            survivor_info = self._select_survivor_info(file_infos, policy)
+
+            group_entry: Dict[str, Any] = {
+                "group_index": idx,
+                "group_id": str(group_key),
+                "survivor": survivor_info["path_str"],
+                "survivor_info": {
+                    "size_bytes": survivor_info["size"],
+                    "modified_at": _iso_utc(survivor_info["modified"])
+                    if survivor_info["modified"] is not None
+                    else None,
+                },
+                "duplicates": [],
+            }
+
+            for info in file_infos:
+                if info["path"] == survivor_info["path"]:
+                    continue
+
+                duplicate_entry: Dict[str, Any] = {
+                    "path": info["path_str"],
+                }
+                if info["size"] is not None:
+                    duplicate_entry["size_bytes"] = info["size"]
+                if info["modified"] is not None:
+                    duplicate_entry["modified_at"] = _iso_utc(info["modified"])
+                if info["error"]:
+                    duplicate_entry["note"] = info["error"]
+
+                if not info["exists"]:
+                    duplicate_entry["proposed"] = {
+                        "action": "skip",
+                        "reason": "missing",
+                    }
+                    files_skipped += 1
+                    files_missing += 1
+                    group_entry["duplicates"].append(duplicate_entry)
+                    continue
+
+                if action == "move_to_quarantine":
+                    destination = self._build_quarantine_destination(
+                        base_quarantine, info["path"]
+                    )
+                    resolved_destination, reason = self._resolve_destination_collision(
+                        destination, collision_strategy, reserved_targets
+                    )
+                    if resolved_destination is None:
+                        duplicate_entry["proposed"] = {
+                            "action": "skip",
+                            "reason": reason or "collision",
+                        }
+                        files_skipped += 1
+                    else:
+                        reserved_targets.add(resolved_destination)
+                        duplicate_entry["proposed"] = {
+                            "action": "move",
+                            "to": str(resolved_destination),
+                        }
+                        files_to_act += 1
+                        if info["size"] is not None:
+                            wasted_size_bytes += info["size"]
+                else:
+                    duplicate_entry["proposed"] = {"action": "delete"}
+                    files_to_act += 1
+                    if info["size"] is not None:
+                        wasted_size_bytes += info["size"]
+
+                group_entry["duplicates"].append(duplicate_entry)
+
+            if group_entry["duplicates"]:
+                plan_groups.append(group_entry)
+
+        stats = {
+            "groups": len(plan_groups),
+            "files_to_act": files_to_act,
+            "files_skipped": files_skipped,
+            "files_missing": files_missing,
+            "wasted_size_bytes": wasted_size_bytes,
+            "wasted_size_mb": round(wasted_size_bytes / (1024 * 1024), 2)
+            if wasted_size_bytes
+            else 0.0,
+        }
+
+        plan: Dict[str, Any] = {
+            "plan_id": plan_id,
+            "created_at": created_at,
+            "policy": policy,
+            "action": action,
+            "collision_strategy": collision_strategy,
+            "quarantine_dir": str(base_quarantine),
+            "groups": plan_groups,
+            "stats": stats,
+            "context": context,
+        }
+        if metadata:
+            plan["metadata"] = metadata
+
+        if output_file is not None:
+            output_path = Path(output_file)
+            self._write_json_file(
+                output_path, self._ensure_json_serializable(plan)
+            )
+        else:
+            output_path = None
+
+        log_fields: Dict[str, Any] = {
+            "plan_id": plan_id,
+            "groups": len(plan_groups),
+            "files_to_act": files_to_act,
+            "files_skipped": files_skipped,
+            "files_missing": files_missing,
+            "action": action,
+            "collision_strategy": collision_strategy,
+        }
+        if output_path is not None:
+            log_fields["plan_file"] = str(output_path)
+
+        self._log_event(
+            "plan_generated",
+            logging.INFO,
+            "Plan generated",
+            context,
+            **{k: v for k, v in log_fields.items() if v is not None},
+        )
+
+        return plan
+
+    def dry_run_plan(
+        self,
+        plan: Union[Dict[str, Any], str, Path],
+    ) -> Dict[str, Any]:
+        """Simulate the execution of a plan without touching the filesystem."""
+        plan_data, plan_path = self._load_plan_source(plan)
+        context = self._resolve_context(plan_data.get("context"))
+
+        summary = {
+            "plan_id": plan_data.get("plan_id"),
+            "moved": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "errors": 0,
+            "missing": 0,
+        }
+
+        for group in plan_data.get("groups", []):
+            for entry in group.get("duplicates", []):
+                proposed = entry.get("proposed") or {}
+                action_type = proposed.get("action")
+                path_str = entry.get("path")
+                source_exists = False
+                if path_str:
+                    try:
+                        source_exists = Path(path_str).exists()
+                    except OSError:
+                        source_exists = False
+
+                if action_type == "move":
+                    summary["moved"] += 1
+                    if path_str and not source_exists:
+                        summary["errors"] += 1
+                        summary["missing"] += 1
+                elif action_type == "delete":
+                    summary["deleted"] += 1
+                    if path_str and not source_exists:
+                        summary["errors"] += 1
+                        summary["missing"] += 1
+                else:
+                    summary["skipped"] += 1
+                    if proposed.get("reason") == "missing":
+                        summary["missing"] += 1
+
+        summary["total"] = summary["moved"] + summary["deleted"] + summary["skipped"]
+
+        log_fields = {
+            "plan_id": summary["plan_id"],
+            "moved": summary["moved"],
+            "deleted": summary["deleted"],
+            "skipped": summary["skipped"],
+            "errors": summary["errors"],
+            "missing": summary["missing"],
+        }
+        if plan_path is not None:
+            log_fields["plan_file"] = str(plan_path)
+
+        self._log_event(
+            "plan_dry_run_completed",
+            logging.INFO,
+            "Plan dry run completed",
+            context,
+            **log_fields,
+        )
+
+        return summary
+
+    def apply_plan(
+        self,
+        plan: Union[Dict[str, Any], str, Path],
+        *,
+        confirm_delete: bool = False,
+        undo_path: Optional[Union[str, Path]] = None,
+    ) -> Dict[str, Any]:
+        """Apply a plan, optionally producing an undo file."""
+        plan_data, plan_path = self._load_plan_source(plan)
+        context = self._resolve_context(plan_data.get("context"))
+
+        plan_action = plan_data.get("action", "move_to_quarantine")
+        collision_strategy = plan_data.get("collision_strategy", "rename")
+        if collision_strategy not in PLAN_COLLISION_STRATEGIES:
+            collision_strategy = "rename"
+        if plan_action == "delete" and not confirm_delete:
+            raise ValueError("confirm_delete must be True when applying delete plans")
+
+        summary = {
+            "plan_id": plan_data.get("plan_id"),
+            "plan_file": str(plan_path) if plan_path else None,
+            "moved": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "errors": 0,
+            "missing": 0,
+        }
+        start = time.perf_counter()
+        undo_actions: List[Dict[str, Any]] = []
+        reserved_destinations: Set[Path] = set()
+
+        quarantine_dir = plan_data.get("quarantine_dir") or str(
+            Path.cwd() / DEFAULT_QUARANTINE_DIRNAME
+        )
+        base_quarantine = Path(quarantine_dir)
+        if not base_quarantine.is_absolute():
+            base_dir = plan_path.parent if plan_path is not None else Path.cwd()
+            base_quarantine = (base_dir / base_quarantine).expanduser()
+        try:
+            base_quarantine = base_quarantine.resolve(strict=False)
+        except Exception:
+            base_quarantine = base_quarantine.expanduser()
+
+        self._log_event(
+            "plan_apply_started",
+            logging.INFO,
+            "Plan apply started",
+            context,
+            plan_id=summary["plan_id"],
+            action=plan_action,
+            plan_file=summary["plan_file"],
+        )
+
+        for group in plan_data.get("groups", []):
+            for entry in group.get("duplicates", []):
+                proposed = entry.get("proposed") or {}
+                action_type = proposed.get("action")
+                source_str = entry.get("path")
+                source_path = Path(source_str) if source_str else None
+
+                if action_type == "move":
+                    if source_path is None:
+                        summary["errors"] += 1
+                        continue
+
+                    dest_str = proposed.get("to")
+                    if dest_str is None:
+                        summary["errors"] += 1
+                        continue
+
+                    dest_path = Path(dest_str)
+                    if not dest_path.is_absolute():
+                        dest_path = base_quarantine / dest_path
+                    try:
+                        dest_path = dest_path.expanduser().resolve(strict=False)
+                    except Exception:
+                        dest_path = dest_path.expanduser()
+
+                    try:
+                        source_exists = source_path.exists()
+                    except OSError:
+                        source_exists = False
+
+                    if not source_exists:
+                        summary["skipped"] += 1
+                        summary["missing"] += 1
+                        self._log_event(
+                            "plan_apply_file_missing",
+                            logging.WARNING,
+                            "File missing during plan apply",
+                            context,
+                            plan_id=summary["plan_id"],
+                            file=source_str,
+                        )
+                        continue
+
+                    needs_resolution = dest_path in reserved_destinations
+                    try:
+                        if dest_path.exists():
+                            needs_resolution = True
+                    except OSError:
+                        pass
+
+                    actual_destination = dest_path
+                    if needs_resolution:
+                        actual_destination, reason = self._resolve_destination_collision(
+                            dest_path, collision_strategy, reserved_destinations
+                        )
+                        if actual_destination is None:
+                            summary["skipped"] += 1
+                            self._log_event(
+                                "plan_apply_skipped",
+                                logging.INFO,
+                                "Skipped plan entry",
+                                context,
+                                plan_id=summary["plan_id"],
+                                file=source_str,
+                                reason=reason,
+                            )
+                            continue
+
+                    try:
+                        actual_destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(source_path), str(actual_destination))
+                        reserved_destinations.add(actual_destination)
+                        summary["moved"] += 1
+                        undo_actions.append(
+                            {
+                                "action": "move",
+                                "from": str(actual_destination),
+                                "to": source_str,
+                                "planned_to": str(dest_path),
+                            }
+                        )
+                    except Exception as exc:
+                        summary["errors"] += 1
+                        self._log_event(
+                            "plan_apply_error",
+                            logging.ERROR,
+                            "Failed to move file",
+                            context,
+                            plan_id=summary["plan_id"],
+                            file=source_str,
+                            destination=str(actual_destination),
+                            exception_type=exc.__class__.__name__,
+                            exception_msg=str(exc),
+                        )
+                        continue
+
+                elif action_type == "delete":
+                    if source_path is None:
+                        summary["errors"] += 1
+                        continue
+
+                    try:
+                        source_exists = source_path.exists()
+                    except OSError:
+                        source_exists = False
+
+                    if not source_exists:
+                        summary["skipped"] += 1
+                        summary["missing"] += 1
+                        self._log_event(
+                            "plan_apply_file_missing",
+                            logging.WARNING,
+                            "File missing during plan apply",
+                            context,
+                            plan_id=summary["plan_id"],
+                            file=source_str,
+                        )
+                        continue
+
+                    try:
+                        source_path.unlink()
+                        summary["deleted"] += 1
+                        undo_actions.append(
+                            {
+                                "action": "delete",
+                                "path": source_str,
+                            }
+                        )
+                    except Exception as exc:
+                        summary["errors"] += 1
+                        self._log_event(
+                            "plan_apply_error",
+                            logging.ERROR,
+                            "Failed to delete file",
+                            context,
+                            plan_id=summary["plan_id"],
+                            file=source_str,
+                            exception_type=exc.__class__.__name__,
+                            exception_msg=str(exc),
+                        )
+                else:
+                    summary["skipped"] += 1
+                    if proposed.get("reason") == "missing":
+                        summary["missing"] += 1
+
+        summary["total"] = summary["moved"] + summary["deleted"] + summary["skipped"]
+        summary["duration_ms"] = self._duration_ms(start)
+
+        if undo_actions:
+            undo_payload = {
+                "plan_id": summary["plan_id"],
+                "undo_id": str(uuid.uuid4()),
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "actions": undo_actions,
+            }
+            if undo_path is not None:
+                undo_path_obj = Path(undo_path)
+            elif plan_path is not None:
+                undo_path_obj = plan_path.with_name(f"undo_{plan_path.stem}.json")
+            else:
+                undo_path_obj = Path("undo.json")
+            self._write_json_file(
+                undo_path_obj, self._ensure_json_serializable(undo_payload)
+            )
+            summary["undo_file"] = str(undo_path_obj)
+
+        log_fields = {
+            "plan_id": summary["plan_id"],
+            "moved": summary["moved"],
+            "deleted": summary["deleted"],
+            "skipped": summary["skipped"],
+            "errors": summary["errors"],
+            "missing": summary["missing"],
+            "duration_ms": summary["duration_ms"],
+            "plan_file": summary.get("plan_file"),
+            "undo_file": summary.get("undo_file"),
+        }
+
+        self._log_event(
+            "plan_apply_completed",
+            logging.INFO,
+            "Plan apply completed",
+            context,
+            **{k: v for k, v in log_fields.items() if v is not None},
+        )
+
+        return summary
+
     def export_results(
         self,
         duplicates: Dict,
@@ -1000,6 +1666,3 @@ if __name__ == "__main__":
     detector = DuplicateDetector()
     detector.export_results(result['duplicates'], output_name)
     print(f"\nResults stored in: {output_name}")
-
-
-

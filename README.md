@@ -43,7 +43,9 @@ All responses are JSON except the export endpoint, which streams the generated f
 - The API normalises extensions so both `.pdf` and `pdf` inputs are accepted.
 - Every successful scan persists a copy in `backend/data/last_scan.json` so other features can reuse the latest payload.
 - Library and API logs follow the NDJSON contract described in `3_espec_log.md`; they stream to stdout, rotate as NDJSON in `logs/duplicate-detector*.log`, and mirror as texto legible en `logs/duplicate-detector*.txt` (override via `DUPLY_LOG_DIR`).
+- The Python library exposes plan helpers: `generate_action_plan` writes `plan.json`, `dry_run_plan` reports the impact, and `apply_plan` executes actions while emitting `undo.json`.
 - Results are cached in memory; restarting the server clears history.
 - `duplicate_detector.py` keeps doing the heavy work, so any improvements there will be reflected automatically.
+
 
 
