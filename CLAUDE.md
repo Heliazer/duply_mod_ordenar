@@ -51,9 +51,10 @@ cd modulos/duplicados
 uvicorn backend.main:app --reload
 ```
 - Servidor: `http://localhost:8000`
+- Frontend integrado: `http://localhost:8000/` (sirve automáticamente `frontend/index.html`)
 - Documentación API: `http://localhost:8000/docs`
 
-**Frontend**:
+**Frontend (alternativo, servidor estático independiente)**:
 ```bash
 python -m http.server 5500 --directory modulos/duplicados/frontend
 ```
@@ -106,6 +107,7 @@ Consultar `modulos/duplicados/3_espec_log.md` para especificación completa de l
 
 ### Endpoints de la API
 
+- `GET /`: Sirve la interfaz web frontend (desde `frontend/index.html`)
 - `POST /scan`: Ejecutar escaneo de duplicados (parámetros: `path`, `method`, `extensions`, `recursive`)
 - `GET /stats`: Obtener estadísticas del último escaneo
 - `GET /export?format=json|csv`: Descargar resultados del último escaneo (archivos guardados en `backend/exports/`)
