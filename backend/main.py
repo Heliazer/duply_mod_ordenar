@@ -109,6 +109,14 @@ class ScanRecord(BaseModel):
 _last_scan: Optional[ScanRecord] = None
 
 
+@app.get("/")
+def root() -> FileResponse:
+    frontend_path = ROOT_DIR / "frontend" / "index.html"
+    if not frontend_path.exists():
+        raise HTTPException(status_code=404, detail="Frontend not found")
+    return FileResponse(frontend_path)
+
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
